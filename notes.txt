@@ -1,0 +1,300 @@
++ Analysis of an incident report from the Tokyo Stock Exchange
+
+On October 24th 2018, the Tokyo Stock Exchange published the following
+incident report regarding a "glitch" that occurred on the morning of October
+9th and impacted market access via their arrowhead trading system:
+https://www.jpx.co.jp/english/corporate/news/news-releases/0060/20181024-02.html
+
+One of my friends drew my attention to this report because of the unusually
+high level of technical details that it contains. In summary, the report and
+accompanying figure explain that two hosts from the same firm tried to
+establish two concurrent TCP connections using the same 4-tuple (IP addresses
+and TCP port numbers). This led to some unspecified issue which generated a
+high volume of traffic and high load on one of the total four "connection
+devices" (perhaps a firewall or IDS?). That device was "suspended" which meant
+that other market participants were not able to place market orders by
+connecting to that device; they had to switch to one of the remaining three.
+In short, Merrill Lynch DOSed the TSE.
+
+The report is clear on the fact that two endpoints used the same 4-tuple but
+it is fuzzy on how that led to the high volume of traffic. It talks of
+discrepancy in the "TCP connection management number", which could be an
+inaccurate way to refer to the TCP sequence number or could be some
+application-level identifier. The report also mentions an "extremely large
+number of retransmission requests being sent to arrowhead". This might refer
+to protocol-level TCP retransmissions or some kind of application-level
+retransmissions.
+
+Obviously, having two hosts establishing connections with the same 4-tuple
+reflects some broken network setup. After reading the report I was curious to
+answer a few questions:
+1) What kind of setup could lead to this?
+2) What happens if you send a SYN into an established TCP connection?
+3) How can we reproduce this issue at the TCP level by twiddling with
+connection parameters and do we get the same result, a high volume of traffic?
+
+Read on to know what the RFCs have to say on the subject and to find out about
+different ways to reproduce such a scenario, including using scapy and using
+the TCP_REPAIR sockopt to set arbitrary connection parameters.
+
+++ Possible network configurations
+Regarding the first question, the report says that the two machines were
+"virtual servers". It's easy to suppose that they were two instances of the
+same VM image configured with a static address. (Other scenarios are plausible
+too.) Even if that is the case, Linux usually randomizes the source port for a
+connection. It's possible that this application is such that it statically
+specifies a source port (by doing bind() before connect()). It's also
+possible, though unlikely, that the servers would not only have been spawned
+from the same image but also resumed from the same state (ex: qemu loadvm)
+which could lead to two machines with RNGs in the same state picking the same
+connection parameters.
+
+Next, we can speculate on how these two virtual servers are connected to the
+rest of the network:
+* Two vservers bridged on the same segment
+* Two vservers using routing
+* Two vservers with different IPs but behind a NAT which mistakenly used the
+  same source port for two connections
+
+This would change what might happen when traffic is sent back from the
+exchange to the investment company. For the remainder of this article, I
+assume the first option and furthermore assume that the machines have the same
+MAC address.
+
+++ TCP Behavior According to RFC
+Regarding the second question, to know what should happen if we send a SYN
+into an established TCP connection we can first have a look at the RFCs.
+TCP is specified in RFC0793 however RFC5961 §4.2 conveniently summarizes the
+parts relevant to this situation:
+
+https://tools.ietf.org/html/rfc5961#section-4.2
+   [RFC0793] currently requires handling of a segment with the SYN bit
+   set in the synchronized state to be as follows:
+
+   1) If the SYN bit is set and the sequence number is outside the
+      expected window, send an ACK back to the sender.
+
+   2) If the SYN bit is set and the sequence number is acceptable, i.e.,
+      (RCV.NXT <= SEG.SEQ < RCV.NXT+RCV.WND), then send a RST segment to
+      the sender.
+
+RFC5961 makes the point that injecting SYN (or RST) segments into a connection
+is an attack vector to forcefully tear down a connection. In order to make
+this more difficult, this RFC introduces the concept of "challenge ACK" and
+mandates the following replacement behavior:
+
+      1) If the SYN bit is set, irrespective of the sequence number, TCP
+      MUST send an ACK (also referred to as challenge ACK) to the remote
+      peer:
+
+      <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+
+      After sending the acknowledgment, TCP MUST drop the unacceptable
+      segment and stop processing further.
+
+RFC5961 was implemented in Linux kernel commit 282f23c6ee34 ("tcp: implement
+RFC 5961 3.2", v3.6-rc1) and commit 0c24604b68fc ("tcp: implement RFC 5961
+4.2", v3.6-rc1) which were also backported to some stable kernels. Therefore,
+the behavior that we can expect from a server depends on whether it has these
+commits or not.
+
+Let's analyze each possibility in the scenario from the TSE glitch with two
+vservers connecting to the exchange server.
+
++++ Without RFC5961
+If the second vserver sends a SYN with duplicate 4-tuple, the result depends
+on the sequence number of the SYN. Copying from the RFC section quoted above:
+
+   1) If the SYN bit is set and the sequence number is outside the
+      expected window, send an ACK back to the sender.
+
+Depending on the network setup, the first and/or the second vserver may
+receive this reply. For the rest of this document, I analyze each possibility
+to see if it might lead to a situation that generates a large volume of
+traffic, especially via retransmissions, as hinted in the TSE incident report.
+
+For the first vserver, this is a dup ACK at snd.nxt (referring to the TCP
+control block variables), this is nothing special.
+For the second vserver, this is an ACK which does not correspond to the SYN.
+It sends a RST. For the (exchange) server, this RST is outside the window, it
+is ignored.
+
+   2) If the SYN bit is set and the sequence number is acceptable, i.e.,
+      (RCV.NXT <= SEG.SEQ < RCV.NXT+RCV.WND), then send a RST segment to
+      the sender.
+
+For the first vserver, the RST closes the connection! What does the
+application do in response? We could speculate but there is no information
+about that in the incident report; that's why I focus on analyzing TCP's
+behavior only in this document.
+For the second vserver, the RST has no effect. The vserver continues to try to
+open a connection.
+
++++ With RFC5961
+
+1) If the SYN bit is set, irrespective of the sequence number, TCP
+      MUST send an ACK (also referred to as challenge ACK) to the remote
+      peer:
+
+      <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+
+      After sending the acknowledgment, TCP MUST drop the unacceptable
+      segment and stop processing further.
+
+As above, for the first vserver, this is a dup ack at snd.nxt. It is nothing
+special.
+For the second vserver, it's an ACK without SYN. The vserver sends a RST with
+seq=(ack number from the ACK segment, ie. rcv.nxt on the server, the "correct"
+sequence number). How does the server answer this RST? We follow RFC5961 §3.2:
+
+   1) If the RST bit is set and the sequence number is outside the
+      current receive window, silently drop the segment.
+
+   2) If the RST bit is set and the sequence number exactly matches the
+      next expected sequence number (RCV.NXT), then TCP MUST reset the
+      connection.
+
+   3) If the RST bit is set and the sequence number does not exactly
+      match the next expected sequence value, yet is within the current
+      receive window (RCV.NXT < SEG.SEQ < RCV.NXT+RCV.WND), TCP MUST
+      send an acknowledgment (challenge ACK):
+
+      <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+
+      After sending the challenge ACK, TCP MUST drop the unacceptable
+      segment and stop processing the incoming packet further.  Further
+      segments destined to this connection will be processed as normal.
+
+We are in the second case, the connection is closed. As mentioned previously,
+we can only speculate about what the application does.
+
+Here I digress for a moment --
+
+When reading this part of the RFC, I initially got very excited because if we
+were in the third case, there would be a loop between the server sending
+challenge acks and the second vserver sending resets. However, this loop would
+not be infinite because Linux implements the tcp_challenge_ack_limit sysctl.
+But read on...
+
+Originally, sys.net.ipv4.tcp_challenge_ack_limit defaulted to 100 (challenge
+acks per second). However, it was found that this global limit could be used
+to implement side-channel attacks which made it easier for an attacker to
+determine the current seq number of a connection between two remote hosts. The
+attacks are described in this LWN article:
+https://lwn.net/Articles/696868/
+
+This vulnerability was fixed upstream in commit 75ff39ccc1bd ("tcp: make
+challenge acks less predictable", v4.7). Where it gets very interesting though
+is that in the absence of this fix, the recommended mitigation is to bump up
+the tcp_challenge_ack_limit "to something enormous (e.g. 999999999)". Hence my
+initial excitement that this is perhaps what had been done. This would have
+been a plausible scenario to explain the large volume of retransmissions that
+is mentioned in the TSE incident report. However, as mentioned before, we are
+in the second case of RFC5961 §3.2, not the third case.
+
+-- end of digression
+
+++ Reproduction
+Regarding the third question, how can we reproduce such a scenario and confirm
+our analysis of the RFCs?
+
+While I was reading the RFC I tested my assumptions by spawning a vm,
+establishing a connection to it, getting the connection parameters (ports,
+seq/ack_seq numbers) using Wireshark and then sending test TCP segments using
+scapy. For example, to inject a SYN into a connection:
+
+sendp(
+	Ether(src="02:be:17:00:00:01", dst="52:54:00:fe:03:00") /
+	IP(src="192.168.14.1", dst="192.168.14.106") /
+	TCP(sport=54322, dport=22, flags="S", seq=4221207298, ack=1957648218),
+	iface="br0")
+
+These parameters represented the current and expected port and sequence
+numbers for the connection. At that point, if host 192.168.14.106 does not
+implement RFC5961, we can see that it answers with a RST that tears down the
+connection:
+# previous segment in the connection
+10:55:32.733657 02:be:17:00:00:01 > 52:54:00:fe:03:00, ethertype IPv4 (0x0800), length 66: 192.168.14.1.54322 > 192.168.14.106.22: Flags [.], ack 1957648218, win 336, options [nop,nop,TS val 3222659237 ecr 2745414917], length 0
+# SYN with reused ports and sequence numbers, sent using scapy
+10:56:03.038846 02:be:17:00:00:01 > 52:54:00:fe:03:00, ethertype IPv4 (0x0800), length 54: 192.168.14.1.54322 > 192.168.14.106.22: Flags [S], seq 4221207298, win 8192, length 0
+# RST
+10:56:03.045468 52:54:00:fe:03:00 > 02:be:17:00:00:01, ethertype IPv4 (0x0800), length 54: 192.168.14.106.22 > 192.168.14.1.54322: Flags [R.], seq 0, ack 4221207299, win 0, length 0
+
+On the other hand, if the server implements RFC5961, we can see that it
+answers with a challenge ACK:
+# previous segment in the connection
+09:05:11.586413 02:be:17:00:00:01 > 52:54:00:fe:03:00, ethertype IPv4 (0x0800), length 66: 192.168.14.1.53118 > 192.168.14.106.22: Flags [.], ack 1554402690, win 336, options [nop,nop,TS val 3216038093 ecr 2149662445], length 0
+# SYN with reused ports and sequence numbers, sent using scapy
+09:05:45.125092 02:be:17:00:00:01 > 52:54:00:fe:03:00, ethertype IPv4 (0x0800), length 54: 192.168.14.1.53118 > 192.168.14.106.22: Flags [S], seq 1049360631, win 8192, length 0
+# challenge ACK
+09:05:45.125529 52:54:00:fe:03:00 > 02:be:17:00:00:01, ethertype IPv4 (0x0800), length 66: 192.168.14.106.22 > 192.168.14.1.53118: Flags [.], ack 1049360631, win 310, options [nop,nop,TS val 2149695984 ecr 3216038093], length 0
+
+While scapy is useful to inject some crafted frames, it does not implement a
+TCP state machine of its own. For instance, we don't see any answer to the
+challenge ACK above because it was received by the host acting as vserver1
+and there is no stand-in for vserver2. In order to experiment further, another
+approach is to force the kernel networking stack to establish a genuine TCP
+connection while reusing the parameters from another connection. The
+traditional unix socket API has no interface for direct control of the seq
+number of a TCP socket. Of course, it would be possible to add such an
+interface via a one-off kernel patch (making changes around tcp_v4_connect())
+or module (using a kprobe). There is however another interface, the TCP_REPAIR
+mode:
+
+https://lwn.net/Articles/495304/
+
+The TCP_REPAIR sockopt allows us to read a TCP socket's seq and ack_seq
+numbers and close the connection without sending a FIN, so that it immediately
+remains established on the remote server. This sockopt also allows us to
+create a new socket which has the same 4-tuple, seq and ack_seq as the
+previous one but is unconnected. At that point, we can take the socket out of
+repair mode and issue a connect(). This will inject a SYN into an established
+connection and we can confirm the behavior of vserver2 predicted when reading
+the RFCs.
+
+https://github.com/benthaman/tcp_repair
+
+I've used TCP_REPAIR mode to implement the above steps. A single machine first
+acts as vserver1 to establish a connection. It then switches role to vserver2
+and tries to establish a second connection.
+
+# ./repro 192.168.10.114 22
+local: 192.168.10.1 59610
+remote: 192.168.10.114 22
+seq 2530361111 ack_seq 2995528171
+^C
+
+The above repository also contains an example trace which is the result of
+using the program.
+
+[screenshot]
+
+frame 1-3: 3WHS by vserver1
+frame 4: SYN with duplicated parameters by vserver2
+frame 5: challenge ACK
+frame 6: RST
+frame 7-11: the SYN is retransmitted and the connection is established by
+vserver2
+
+++ Open Possibilities
+While researching this issue I stumbled upon reports of actual cases where TCP
+enters into a loop of dup acks between two hosts:
+
+https://git.kernel.org/pub/scm/linux/kernel/git/davem/net-next.git/commit/?id=f06535c599354816cfbc653ce8965804c7385c61
+
+However, those scenarios involve traffic mangling by a middlebox (or
+man-in-the-middle) rather than the split-brain scenario described in the TSE
+incident report.
+
+++ Conclusion
+We analyzed how TCP behaves if we send a SYN into an established connection,
+in particular because of two virtual servers that use the same 4-tuple as
+described in an incident report published by the Tokyo Stock Exchange. We see
+that TCP behaves reasonably well to this misconfigured network; no scenarios
+were found that lead to a large volume of retransmissions at the TCP level. We
+found some scenarios that lead to the connection being closed. We tested
+different scenarios using traffic injection by way of scapy and socket
+"mangling" by way of TCP_REPAIR. While the possibility of a high volume of
+traffic caused by retransmissions at the TCP level is not ruled out, it seems
+more likely that the incident described was related to application-level
+behavior than protocol-level behavior.
